@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 from copy import deepcopy
 from datetime import datetime
 from itertools import product
@@ -107,17 +109,32 @@ def main() -> None:
 
     output_dir = Path(cfg.get("output_dir", "results/ablations"))
     runs = expand_grid(cfg)
-    topics = load_twinviews_huggingface()
-    if cfg.get("n_topics") is not None:
-        topics = topics[: int(cfg["n_topics"])]
+    paired_docs = load_twinviews_huggingface()
 
     summary_rows: list[dict[str, Any]] = []
+    run_results_cache: dict[str, list[Any]] = {}
 
     for i, run in enumerate(runs, start=1):
         run_cfg = run["config"]
         params = run["params"]
+
+        # Match run_eval topic selection: keep full dataset and pass n_topics via config.
+        if cfg.get("n_topics") is not None:
+            run_cfg["n_topics"] = int(cfg["n_topics"])
+
+        run_cfg_key = hashlib.sha256(
+            json.dumps(run_cfg, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
         run_dir = output_dir / f"run_{i:03d}"
-        run_results = run_experiment(run_cfg, topics)
+        if run_cfg_key in run_results_cache:
+            print(f"[{i}/{len(runs)}] Reusing computed results for duplicate effective config")
+            run_results = run_results_cache[run_cfg_key]
+        else:
+            print(f"[{i}/{len(runs)}] Executing effective config")
+            run_results = run_experiment(run_cfg, paired_docs)
+            run_results_cache[run_cfg_key] = run_results
+
         write_results(run_results, run_dir)
 
         systems = sorted({r.system for r in run_results})

@@ -571,7 +571,12 @@ def run_experiment(
 
                 hf_logging.set_verbosity_error()
                 model = SentenceTransformer(embedding_model)
-                all_embeddings = model.encode(all_texts, convert_to_numpy=True)
+                print("Computing local document embeddings (this can take several minutes)...")
+                all_embeddings = model.encode(
+                    all_texts,
+                    convert_to_numpy=True,
+                    show_progress_bar=True,
+                )
 
             if embedding_cache_path is not None:
                 np.save(embedding_cache_path, all_embeddings.astype(np.float32))
@@ -604,7 +609,12 @@ def run_experiment(
 
                 hf_logging.set_verbosity_error()
                 model = SentenceTransformer(embedding_model)
-            query_embeddings = model.encode(questions, convert_to_numpy=True)
+            print(f"Computing local query embeddings for {len(questions)} topics...")
+            query_embeddings = model.encode(
+                questions,
+                convert_to_numpy=True,
+                show_progress_bar=True,
+            )
 
         if query_cache_path is not None:
             np.save(query_cache_path, query_embeddings.astype(np.float32))

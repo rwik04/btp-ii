@@ -1,6 +1,6 @@
 experiment_name: btp-ii-ablations
 output_dir: results/ablations
-n_topics: null
+n_topics: 30
 
 base:
   dataset: wwbrannon/twinviews-13k
