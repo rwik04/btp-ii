@@ -1,0 +1,32 @@
+experiment_name: btp-ii-default
+output_dir: results
+dataset: wwbrannon/twinviews-13k
+n_topics: null
+
+retrieval:
+  N: 20
+  k: 6
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  use_modal: true
+  use_preprocessed_corpus: true
+  use_embedding_cache: true
+  embedding_cache_dir: data/cache
+  reindex_qdrant_on_eval: false
+
+lfgd:
+  alpha: 0.5
+  tau: 0.05
+
+llm:
+  # Synthesis models
+  synth_model: gpt-5.4-mini
+  synth_provider: openai
+  synth_reasoning_effort: low
+
+  # Judge model
+  judge_model: gpt-5.4-mini
+  judge_provider: openai
+  judge_reasoning_effort: low
+
+systems:
+  - lfgd

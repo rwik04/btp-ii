@@ -1,0 +1,33 @@
+experiment_name: btp-ii-ablations
+output_dir: results/ablations
+n_topics: null
+
+base:
+  dataset: wwbrannon/twinviews-13k
+  retrieval:
+    k: 6
+    use_modal: false
+    embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  lfgd:
+    alpha: 0.5
+    tau: 0.05
+  llm:
+    synth_model: llama-3.1-8b-instant
+    synth_provider: groq
+    judge_model: llama-3.1-8b-instant
+    judge_provider: groq
+  systems:
+    - lfgd
+    - unmitigated
+    - refarag
+    - fairrag_select
+
+grid:
+  alpha: [0.3, 0.5, 0.7, 1.0]
+  tau: [0.05]
+  N: [10, 20, 30]
+  embedding_model:
+    - sentence-transformers/all-MiniLM-L6-v2
+    - BAAI/bge-large-en-v1.5
+  axis_source: [pca, random, query-doc-diff]
+  fairness_loss: [wasserstein1, variance, kl-binned]

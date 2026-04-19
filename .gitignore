@@ -1,0 +1,21 @@
+__pycache__/
+.pytest_cache/
+.venv/
+
+uv.lock
+
+# Environment
+.env
+btp_ii_lfgd.egg-info
+
+# Results
+results/
+
+# Data
+*/cache/
+*/qdrant/
+bm25.pkl
+embeddings.npy
+qdrant_index.json
+twinviews-13k.csv
+documents.json
