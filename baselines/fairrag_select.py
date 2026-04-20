@@ -13,7 +13,10 @@ The BTP-I approach:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Literal, Optional
 
@@ -22,6 +25,66 @@ from dotenv import load_dotenv
 load_dotenv()
 
 Group = Literal["l", "r"]
+
+_FAIRRAG_SELECT_CACHE: dict[str, List[int]] = {}
+_FAIRRAG_CACHE_LOADED = False
+_FAIRRAG_CACHE_PATH = Path("data/cache/fairrag_select_cache.json")
+_FAIRRAG_CACHE_DIRTY_WRITES = 0
+_FAIRRAG_CLIENTS: dict[str, object] = {}
+
+
+def _load_fairrag_cache() -> None:
+    global _FAIRRAG_CACHE_LOADED
+    if _FAIRRAG_CACHE_LOADED:
+        return
+    _FAIRRAG_CACHE_LOADED = True
+    if not _FAIRRAG_CACHE_PATH.exists():
+        return
+
+    try:
+        with open(_FAIRRAG_CACHE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if isinstance(value, list):
+                    _FAIRRAG_SELECT_CACHE[str(key)] = [int(v) for v in value]
+    except Exception:
+        return
+
+
+def _save_fairrag_cache() -> None:
+    try:
+        _FAIRRAG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_FAIRRAG_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_FAIRRAG_SELECT_CACHE, f, ensure_ascii=True)
+    except Exception:
+        return
+
+
+def _get_llm_client(provider: str):
+    key = provider.strip().lower()
+    client = _FAIRRAG_CLIENTS.get(key)
+    if client is not None:
+        return client
+
+    if key == "groq":
+        from groq import Groq
+
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    elif key == "openai":
+        from openai import OpenAI
+
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    else:
+        from openai import OpenAI
+
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+        )
+
+    _FAIRRAG_CLIENTS[key] = client
+    return client
 
 
 @dataclass
@@ -74,6 +137,7 @@ def rerank_chunks_llm(
     """
     if not candidate_texts:
         return []
+    _load_fairrag_cache()
     target_k = min(target_k, len(candidate_texts))
 
     # Determine model and provider
@@ -83,6 +147,32 @@ def rerank_chunks_llm(
         provider = "groq"
     elif not provider and os.getenv("OPENROUTER_API_KEY"):
         provider = "openrouter"
+
+    cache_key = hashlib.sha256(
+        json.dumps(
+            {
+                "question": question,
+                "candidate_texts": candidate_texts,
+                "candidate_groups": candidate_groups,
+                "target_k": target_k,
+                "model": model,
+                "provider": provider,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if cache_key in _FAIRRAG_SELECT_CACHE:
+        return list(_FAIRRAG_SELECT_CACHE[cache_key])
+
+    def _cache_and_return(indices: List[int]) -> List[int]:
+        global _FAIRRAG_CACHE_DIRTY_WRITES
+        _FAIRRAG_SELECT_CACHE[cache_key] = list(indices)
+        _FAIRRAG_CACHE_DIRTY_WRITES += 1
+        if _FAIRRAG_CACHE_DIRTY_WRITES >= 32:
+            _save_fairrag_cache()
+            _FAIRRAG_CACHE_DIRTY_WRITES = 0
+        return indices
 
     def _balanced_fallback_indices(groups: List[Group], k: int) -> List[int]:
         l_indices = [i for i, g in enumerate(groups) if g == "l"]
@@ -111,28 +201,17 @@ def rerank_chunks_llm(
         return selected[:k]
 
     # Build LLM client
-    client = None
     try:
+        model = model or ""
         if provider == "groq":
-            from groq import Groq
-
-            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
             model = model or os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
         elif provider == "openai":
-            from openai import OpenAI
-
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
             model = model or os.getenv("OPENAI_MODEL", "gpt-5.4-nano")
         else:
-            from openai import OpenAI
-
-            client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=os.getenv("OPENROUTER_API_KEY"),
-            )
             model = model or os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b")
+        client = _get_llm_client(provider)
     except Exception:
-        return _balanced_fallback_indices(candidate_groups, target_k)
+        return _cache_and_return(_balanced_fallback_indices(candidate_groups, target_k))
 
     # Build prompt
     half_k = target_k // 2
@@ -185,12 +264,15 @@ Return strictly in this form: 2,5,7,9,11,12
             if len([i for i in selected if candidate_groups[i] == "l"]) >= half_k and len(
                 [i for i in selected if candidate_groups[i] == "r"]
             ) >= half_k:
-                return selected[:target_k]
-            return _balanced_fallback_indices(candidate_groups, target_k)
+                return _cache_and_return(selected[:target_k])
+            return _cache_and_return(_balanced_fallback_indices(candidate_groups, target_k))
     except Exception:
-        return _balanced_fallback_indices(candidate_groups, target_k)
+        return _cache_and_return(_balanced_fallback_indices(candidate_groups, target_k))
 
-    return _balanced_fallback_indices(candidate_groups, target_k)
+    result = _cache_and_return(_balanced_fallback_indices(candidate_groups, target_k))
+    if _FAIRRAG_CACHE_DIRTY_WRITES:
+        _save_fairrag_cache()
+    return result
 
 
 def fairrag_select(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -17,10 +18,23 @@ from typing import List
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
 
 from data import load_twinviews_huggingface
 from lfgd import estimate_bias_axis_with_sign
 from retrieval import DenseRetriever
+
+
+def _sanitize_model_name(model_name: str) -> str:
+    return "".join(c if c.isalnum() or c in {".", "_", "-"} else "_" for c in model_name)
+
+
+def _hash_text_list(values: List[str]) -> str:
+    h = hashlib.sha256()
+    for v in values:
+        h.update(v.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def compute_label_axis(embeddings: np.ndarray, labels: List[str]) -> np.ndarray:
@@ -47,6 +61,8 @@ def analyze_axis_correlation(
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     n_candidates: int = 20,
     n_topics: int | None = None,
+    embedding_cache_dir: Path = Path("data/cache"),
+    use_embedding_cache: bool = True,
 ) -> dict:
     paired_docs = load_twinviews_huggingface()
     if n_topics is not None:
@@ -60,18 +76,62 @@ def analyze_axis_correlation(
         all_texts.append(paired.right)
         all_labels.append("r")
 
+    topics = [p.topic for p in paired_docs]
+
     model = SentenceTransformer(embedding_model)
-    embeddings = model.encode(all_texts, convert_to_numpy=True)
+
+    model_key = _sanitize_model_name(embedding_model)
+    doc_hash = _hash_text_list(all_texts)[:16]
+    query_hash = _hash_text_list(topics)[:16]
+
+    doc_cache_path = embedding_cache_dir / f"axis_doc_emb_{model_key}_{doc_hash}.npy"
+    query_cache_path = embedding_cache_dir / f"axis_query_emb_{model_key}_{query_hash}.npy"
+
+    embedding_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if use_embedding_cache and doc_cache_path.exists():
+        print(f"Loaded cached document embeddings: {doc_cache_path}")
+        embeddings = np.load(doc_cache_path)
+    else:
+        print(f"Computing document embeddings for {len(all_texts)} texts...")
+        embeddings = model.encode(
+            all_texts,
+            convert_to_numpy=True,
+            show_progress_bar=True,
+            batch_size=128,
+        )
+        if use_embedding_cache:
+            np.save(doc_cache_path, embeddings.astype(np.float32))
+            print(f"Saved document embedding cache: {doc_cache_path}")
+
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     embeddings = embeddings / norms
+
+    if use_embedding_cache and query_cache_path.exists():
+        print(f"Loaded cached query embeddings: {query_cache_path}")
+        query_embeddings = np.load(query_cache_path)
+    else:
+        print(f"Computing query embeddings for {len(topics)} topics...")
+        query_embeddings = model.encode(
+            topics,
+            convert_to_numpy=True,
+            show_progress_bar=True,
+            batch_size=128,
+        )
+        if use_embedding_cache:
+            np.save(query_cache_path, query_embeddings.astype(np.float32))
+            print(f"Saved query embedding cache: {query_cache_path}")
 
     retriever = DenseRetriever(embedding_dim=embeddings.shape[1])
     retriever.index(all_texts, embeddings)
 
     per_topic: list[dict] = []
-    for paired in paired_docs:
-        query_emb = model.encode(paired.topic, convert_to_numpy=True)
+    for paired, query_emb in tqdm(
+        zip(paired_docs, query_embeddings),
+        total=len(paired_docs),
+        desc="Analyzing topics",
+    ):
         q_norm = np.linalg.norm(query_emb)
         if q_norm == 0:
             continue
@@ -132,6 +192,8 @@ def main() -> None:
     parser.add_argument("--embedding-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--n-candidates", type=int, default=20)
     parser.add_argument("--n-topics", type=int, default=None)
+    parser.add_argument("--embedding-cache-dir", type=str, default="data/cache")
+    parser.add_argument("--no-embedding-cache", action="store_true")
     args = parser.parse_args()
 
     summary = analyze_axis_correlation(
@@ -139,6 +201,8 @@ def main() -> None:
         embedding_model=args.embedding_model,
         n_candidates=args.n_candidates,
         n_topics=args.n_topics,
+        embedding_cache_dir=Path(args.embedding_cache_dir),
+        use_embedding_cache=not args.no_embedding_cache,
     )
     print(f"Mean cosine: {summary['mean_cosine']:.4f}")
     print(f"Saved JSON: {summary['json_path']}")

@@ -11,9 +11,11 @@ Usage:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -60,6 +62,12 @@ DEFAULT_N = 20
 DEFAULT_K = 6
 DEFAULT_ALPHA = 0.5
 DEFAULT_TAU = 0.05
+
+# Process-level caches to avoid repeated identical LLM calls across ablation runs.
+_SYNTHESIS_CACHE: dict[str, str] = {}
+_JUDGE_CACHE: dict[str, str] = {}
+_LLM_CACHE_LOADED = False
+_LLM_CACHE_PATH = Path("data/cache/llm_eval_cache.json")
 
 
 @dataclass
@@ -112,6 +120,60 @@ def _sanitize_model_name(model_name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", model_name)
 
 
+def _resolve_qdrant_collection_name(config: dict, embedding_model: str) -> str:
+    retrieval_cfg = config.get("retrieval", {})
+    explicit_name = retrieval_cfg.get("qdrant_collection")
+    if explicit_name:
+        return str(explicit_name)
+
+    base_name = retrieval_cfg.get("qdrant_collection_base") or os.getenv("QDRANT_COLLECTION", "twinviews-13k")
+    return f"{base_name}-{_sanitize_model_name(embedding_model)}"
+
+
+def _stable_cache_key(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _load_llm_caches() -> None:
+    global _LLM_CACHE_LOADED
+    if _LLM_CACHE_LOADED:
+        return
+
+    _LLM_CACHE_LOADED = True
+    if not _LLM_CACHE_PATH.exists():
+        return
+
+    try:
+        with open(_LLM_CACHE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        synth = payload.get("synthesis", {})
+        judge = payload.get("judge", {})
+        if isinstance(synth, dict):
+            _SYNTHESIS_CACHE.update({str(k): str(v) for k, v in synth.items()})
+        if isinstance(judge, dict):
+            _JUDGE_CACHE.update({str(k): str(v) for k, v in judge.items()})
+    except Exception:
+        return
+
+
+def _save_llm_caches() -> None:
+    try:
+        _LLM_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LLM_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "synthesis": _SYNTHESIS_CACHE,
+                    "judge": _JUDGE_CACHE,
+                },
+                f,
+                ensure_ascii=True,
+            )
+    except Exception:
+        return
+
+
 def _load_preprocessed_corpus(
     data_dir: Path = Path("data"),
 ) -> tuple[list[str], np.ndarray, list[str], list[str]] | None:
@@ -140,6 +202,7 @@ def build_retriever(
     embeddings: np.ndarray,
     use_hybrid: bool = False,
     reindex_qdrant: bool = False,
+    qdrant_collection_name: str | None = None,
 ) -> HybridRetriever | DenseRetriever | QdrantDenseRetriever:
     """
     Build retrieval indexes.
@@ -149,12 +212,14 @@ def build_retriever(
         embeddings: Array of shape (N, d) with L2-normalized embeddings
         use_hybrid: Whether to use hybrid BM25+dense retrieval
         reindex_qdrant: If True, force upsert/reindex into Qdrant
+        qdrant_collection_name: Optional collection name for Qdrant index
 
     Returns:
         HybridRetriever (hybrid mode) or DenseRetriever (dense-only mode)
     """
     dense = QdrantDenseRetriever(
         embedding_dim=embeddings.shape[1],
+        collection_name=qdrant_collection_name,
         recreate_on_index=reindex_qdrant,
     )
     dense.attach_corpus_cache(texts, embeddings)
@@ -312,6 +377,9 @@ def evaluate_one_query(
     k: int = DEFAULT_K,
     alpha: float = DEFAULT_ALPHA,
     tau: float = DEFAULT_TAU,
+    generator: Generator | None = None,
+    judge: Judge | None = None,
+    init_errors: List[str] | None = None,
 ) -> List[EvalResult]:
     """
     Evaluate all systems on a single query.
@@ -328,33 +396,33 @@ def evaluate_one_query(
         List of EvalResult (one per system)
     """
     results = []
-    init_errors: list[str] = []
-    generator = None
-    judge = None
-    try:
-        generator = Generator(
-            model=llm_config.get("synth_model"),
-            provider=llm_config.get("synth_provider"),
-            reasoning_effort=llm_config.get("synth_reasoning_effort"),
-        )
-    except Exception as e:
-        generator = None
-        init_errors.append(f"generator_init: {e}")
+    base_errors = list(init_errors or [])
+    if generator is None and not any(err.startswith("generator_init:") for err in base_errors):
+        try:
+            generator = Generator(
+                model=llm_config.get("synth_model"),
+                provider=llm_config.get("synth_provider"),
+                reasoning_effort=llm_config.get("synth_reasoning_effort"),
+            )
+        except Exception as e:
+            generator = None
+            base_errors.append(f"generator_init: {e}")
 
-    try:
-        judge = Judge(
-            model=llm_config.get("judge_model"),
-            provider=llm_config.get("judge_provider"),
-            reasoning_effort=llm_config.get("judge_reasoning_effort"),
-        )
-    except Exception as e:
-        judge = None
-        init_errors.append(f"judge_init: {e}")
+    if judge is None and not any(err.startswith("judge_init:") for err in base_errors):
+        try:
+            judge = Judge(
+                model=llm_config.get("judge_model"),
+                provider=llm_config.get("judge_provider"),
+                reasoning_effort=llm_config.get("judge_reasoning_effort"),
+            )
+        except Exception as e:
+            judge = None
+            base_errors.append(f"judge_init: {e}")
 
     for system in systems:
         try:
             start = time.time()
-            system_errors = list(init_errors)
+            system_errors = list(base_errors)
             k_effective = min(k, len(candidate_docs))
             if k_effective == 0:
                 raise ValueError("No candidate docs to evaluate")
@@ -396,20 +464,32 @@ def evaluate_one_query(
             assembled_relevance = [d.relevance_score for d in assembled_docs]
 
             synthesis_text = assemble_context(assembled_docs)
+            synth_docs_payload = [
+                {
+                    "text": d.text,
+                    "side": (d.metadata or {}).get("side", "?"),
+                    "lean_score": float(d.lean_score),
+                    "relevance_score": float(d.relevance_score),
+                }
+                for d in assembled_docs
+            ]
             if generator is not None:
                 try:
-                    synthesis_text = generator.synthesize(
-                        question,
-                        [
-                            {
-                                "text": d.text,
-                                "side": (d.metadata or {}).get("side", "?"),
-                                "lean_score": d.lean_score,
-                                "relevance_score": d.relevance_score,
-                            }
-                            for d in assembled_docs
-                        ],
-                    ).synthesis
+                    synth_key = _stable_cache_key(
+                        {
+                            "question": question,
+                            "model": llm_config.get("synth_model"),
+                            "provider": llm_config.get("synth_provider"),
+                            "reasoning_effort": llm_config.get("synth_reasoning_effort"),
+                            "docs": synth_docs_payload,
+                        }
+                    )
+                    cached_synthesis = _SYNTHESIS_CACHE.get(synth_key)
+                    if cached_synthesis is not None:
+                        synthesis_text = cached_synthesis
+                    else:
+                        synthesis_text = generator.synthesize(question, synth_docs_payload).synthesis
+                        _SYNTHESIS_CACHE[synth_key] = synthesis_text
                 except Exception as e:
                     system_errors.append(f"synthesis: {e}")
 
@@ -428,8 +508,21 @@ def evaluate_one_query(
             judge_category = "Mixed/Unclear"
             if judge is not None:
                 try:
-                    judge_result = judge.classify(synthesis_text)
-                    judge_category = judge_result.category
+                    judge_key = _stable_cache_key(
+                        {
+                            "text": synthesis_text,
+                            "model": llm_config.get("judge_model"),
+                            "provider": llm_config.get("judge_provider"),
+                            "reasoning_effort": llm_config.get("judge_reasoning_effort"),
+                        }
+                    )
+                    cached_category = _JUDGE_CACHE.get(judge_key)
+                    if cached_category is not None:
+                        judge_category = cached_category
+                    else:
+                        judge_result = judge.classify(synthesis_text)
+                        judge_category = judge_result.category
+                        _JUDGE_CACHE[judge_key] = judge_category
                 except Exception as e:
                     system_errors.append(f"judge: {e}")
 
@@ -488,6 +581,8 @@ def run_experiment(
     Returns:
         List of EvalResult for all queries and systems
     """
+    _load_llm_caches()
+
     # Load config values
     N = config.get("retrieval", {}).get("N", DEFAULT_N)
     K = config.get("retrieval", {}).get("k", DEFAULT_K)
@@ -503,6 +598,7 @@ def run_experiment(
     use_preprocessed_corpus = config.get("retrieval", {}).get("use_preprocessed_corpus", True)
 
     llm_config = config.get("llm", {})
+    llm_concurrency = max(1, int(llm_config.get("concurrency", 1)))
 
     eval_topics = get_unique_topics(paired_docs, sort_by_frequency=True)
     if n_topics:
@@ -638,11 +734,13 @@ def run_experiment(
     all_embeddings = all_embeddings / norms
 
     # Build retriever
+    qdrant_collection_name = _resolve_qdrant_collection_name(config, embedding_model)
     dense = build_retriever(
         all_texts,
         all_embeddings,
         use_hybrid=False,
         reindex_qdrant=reindex_qdrant,
+        qdrant_collection_name=qdrant_collection_name,
     )
     if isinstance(dense, QdrantDenseRetriever):
         if reindex_qdrant:
@@ -652,7 +750,30 @@ def run_experiment(
 
     all_results: List[EvalResult] = []
 
+    # Initialize LLM clients once per run and reuse for all topics.
+    shared_generator = None
+    shared_judge = None
+    shared_init_errors: list[str] = []
+    try:
+        shared_generator = Generator(
+            model=llm_config.get("synth_model"),
+            provider=llm_config.get("synth_provider"),
+            reasoning_effort=llm_config.get("synth_reasoning_effort"),
+        )
+    except Exception as e:
+        shared_init_errors.append(f"generator_init: {e}")
+
+    try:
+        shared_judge = Judge(
+            model=llm_config.get("judge_model"),
+            provider=llm_config.get("judge_provider"),
+            reasoning_effort=llm_config.get("judge_reasoning_effort"),
+        )
+    except Exception as e:
+        shared_init_errors.append(f"judge_init: {e}")
+
     print(f"Running evaluation on {len(eval_topics)} topics...")
+    topic_payloads: list[tuple[int, str, list[RetrievedDoc]]] = []
     for topic_idx, topic in enumerate(tqdm(eval_topics, desc="Processing topics")):
         question = topic  # In twinviews, topic is the question
 
@@ -695,20 +816,58 @@ def run_experiment(
                 )
             )
 
-        # Evaluate
-        query_results = evaluate_one_query(
-            query_idx=len(all_results),
-            topic=topic,
-            question=question,
-            candidate_docs=candidate_docs,
-            systems=systems,
-            llm_config=llm_config,
-            k=K,
-            alpha=alpha,
-            tau=tau,
-        )
-        all_results.extend(query_results)
+        topic_payloads.append((topic_idx, topic, candidate_docs))
 
+    if llm_concurrency == 1 or len(topic_payloads) <= 1:
+        for topic_idx, topic, candidate_docs in topic_payloads:
+            query_results = evaluate_one_query(
+                query_idx=topic_idx,
+                topic=topic,
+                question=topic,
+                candidate_docs=candidate_docs,
+                systems=systems,
+                llm_config=llm_config,
+                k=K,
+                alpha=alpha,
+                tau=tau,
+                generator=shared_generator,
+                judge=shared_judge,
+                init_errors=shared_init_errors,
+            )
+            all_results.extend(query_results)
+    else:
+        print(f"Evaluating topics with LLM concurrency={llm_concurrency}...")
+
+        def _eval_topic(item: tuple[int, str, list[RetrievedDoc]]) -> tuple[int, list[EvalResult]]:
+            topic_idx, topic, candidate_docs = item
+            # Avoid sharing model clients across threads; outputs remain deterministic.
+            results = evaluate_one_query(
+                query_idx=topic_idx,
+                topic=topic,
+                question=topic,
+                candidate_docs=candidate_docs,
+                systems=systems,
+                llm_config=llm_config,
+                k=K,
+                alpha=alpha,
+                tau=tau,
+                generator=None,
+                judge=None,
+                init_errors=[],
+            )
+            return topic_idx, results
+
+        ordered_results: dict[int, list[EvalResult]] = {}
+        with ThreadPoolExecutor(max_workers=llm_concurrency) as executor:
+            futures = [executor.submit(_eval_topic, item) for item in topic_payloads]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Evaluating topics"):
+                topic_idx, query_results = future.result()
+                ordered_results[topic_idx] = query_results
+
+        for idx in sorted(ordered_results):
+            all_results.extend(ordered_results[idx])
+
+    _save_llm_caches()
     return all_results
 
 

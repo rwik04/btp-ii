@@ -2,11 +2,20 @@ experiment_name: btp-ii-ablations
 output_dir: results/ablations
 n_topics: 30
 
+# base:
+#   dataset: wwbrannon/twinviews-13k
+#   retrieval:
+#     k: 6
+#     use_modal: false
+#     embedding_model: sentence-transformers/all-MiniLM-L6-v2
 base:
-  dataset: wwbrannon/twinviews-13k
   retrieval:
     k: 6
-    use_modal: false
+    use_modal: true                 # offload embedding to Modal GPU
+    use_embedding_cache: true       # cache doc/query embeddings
+    embedding_cache_dir: data/cache
+    reindex_qdrant_on_eval: false   # reuse existing Qdrant index
+    use_preprocessed_corpus: true   # faster startup for MiniLM-only fast ablations
     embedding_model: sentence-transformers/all-MiniLM-L6-v2
   lfgd:
     alpha: 0.5
@@ -16,18 +25,19 @@ base:
     synth_provider: groq
     judge_model: llama-3.1-8b-instant
     judge_provider: groq
+    concurrency: 4
+    fairrag_model: llama-3.1-8b-instant
+    fairrag_provider: groq
   systems:
     - lfgd
-    - unmitigated
-    - refarag
-    - fairrag_select
+    # Baselines are evaluated separately; keeping them here makes ablations hours-long.
 
 grid:
   alpha: [0.3, 0.5, 0.7, 1.0]
   tau: [0.05]
-  N: [10, 20, 30]
+  N: [20]
   embedding_model:
     - sentence-transformers/all-MiniLM-L6-v2
-    - BAAI/bge-large-en-v1.5
-  axis_source: [pca, random, query-doc-diff]
-  fairness_loss: [wasserstein1, variance, kl-binned]
+  # Currently summary-only in experiments/ablations.py; keep fixed to avoid duplicate runs.
+  axis_source: [pca]
+  fairness_loss: [wasserstein1]
