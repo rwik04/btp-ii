@@ -66,8 +66,7 @@ DEFAULT_TAU = 0.05
 # Process-level caches to avoid repeated identical LLM calls across ablation runs.
 _SYNTHESIS_CACHE: dict[str, str] = {}
 _JUDGE_CACHE: dict[str, str] = {}
-_LLM_CACHE_LOADED = False
-_LLM_CACHE_PATH = Path("data/cache/llm_eval_cache.json")
+_ACTIVE_LLM_CACHE_PATH: Path | None = None
 
 
 @dataclass
@@ -136,17 +135,44 @@ def _stable_cache_key(payload: dict) -> str:
     ).hexdigest()
 
 
-def _load_llm_caches() -> None:
-    global _LLM_CACHE_LOADED
-    if _LLM_CACHE_LOADED:
+def _resolve_llm_cache_path(llm_config: dict) -> Path:
+    """Resolve cache file path from config, optionally partitioned per model pair."""
+    base_path = Path(llm_config.get("cache_path", "data/cache/llm_eval_cache.json"))
+    cache_scope = str(llm_config.get("cache_scope", "per_model")).strip().lower()
+
+    if cache_scope == "shared":
+        return base_path
+    if cache_scope != "per_model":
+        raise ValueError("llm.cache_scope must be either 'shared' or 'per_model'")
+
+    # Partition cache by synth/judge model config so model-comparison runs never cross-hit.
+    scope_payload = {
+        "synth_model": llm_config.get("synth_model"),
+        "synth_provider": llm_config.get("synth_provider"),
+        "synth_reasoning_effort": llm_config.get("synth_reasoning_effort"),
+        "judge_model": llm_config.get("judge_model"),
+        "judge_provider": llm_config.get("judge_provider"),
+        "judge_reasoning_effort": llm_config.get("judge_reasoning_effort"),
+    }
+    scope_hash = _stable_cache_key(scope_payload)[:12]
+    suffix = base_path.suffix or ".json"
+    return base_path.with_name(f"{base_path.stem}__{scope_hash}{suffix}")
+
+
+def _load_llm_caches(cache_path: Path) -> None:
+    global _ACTIVE_LLM_CACHE_PATH
+    if _ACTIVE_LLM_CACHE_PATH == cache_path:
         return
 
-    _LLM_CACHE_LOADED = True
-    if not _LLM_CACHE_PATH.exists():
+    _SYNTHESIS_CACHE.clear()
+    _JUDGE_CACHE.clear()
+    _ACTIVE_LLM_CACHE_PATH = cache_path
+
+    if not cache_path.exists():
         return
 
     try:
-        with open(_LLM_CACHE_PATH, "r", encoding="utf-8") as f:
+        with open(cache_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
         synth = payload.get("synthesis", {})
         judge = payload.get("judge", {})
@@ -158,10 +184,10 @@ def _load_llm_caches() -> None:
         return
 
 
-def _save_llm_caches() -> None:
+def _save_llm_caches(cache_path: Path) -> None:
     try:
-        _LLM_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(_LLM_CACHE_PATH, "w", encoding="utf-8") as f:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
                     "synthesis": _SYNTHESIS_CACHE,
@@ -380,6 +406,7 @@ def evaluate_one_query(
     generator: Generator | None = None,
     judge: Judge | None = None,
     init_errors: List[str] | None = None,
+    use_llm_cache: bool = True,
 ) -> List[EvalResult]:
     """
     Evaluate all systems on a single query.
@@ -484,12 +511,13 @@ def evaluate_one_query(
                             "docs": synth_docs_payload,
                         }
                     )
-                    cached_synthesis = _SYNTHESIS_CACHE.get(synth_key)
-                    if cached_synthesis is not None:
-                        synthesis_text = cached_synthesis
-                    else:
+                    cached_synthesis = _SYNTHESIS_CACHE.get(synth_key) if use_llm_cache else None
+                    if cached_synthesis is None:
                         synthesis_text = generator.synthesize(question, synth_docs_payload).synthesis
-                        _SYNTHESIS_CACHE[synth_key] = synthesis_text
+                        if use_llm_cache:
+                            _SYNTHESIS_CACHE[synth_key] = synthesis_text
+                    else:
+                        synthesis_text = cached_synthesis
                 except Exception as e:
                     system_errors.append(f"synthesis: {e}")
 
@@ -516,13 +544,14 @@ def evaluate_one_query(
                             "reasoning_effort": llm_config.get("judge_reasoning_effort"),
                         }
                     )
-                    cached_category = _JUDGE_CACHE.get(judge_key)
-                    if cached_category is not None:
-                        judge_category = cached_category
-                    else:
+                    cached_category = _JUDGE_CACHE.get(judge_key) if use_llm_cache else None
+                    if cached_category is None:
                         judge_result = judge.classify(synthesis_text)
                         judge_category = judge_result.category
-                        _JUDGE_CACHE[judge_key] = judge_category
+                        if use_llm_cache:
+                            _JUDGE_CACHE[judge_key] = judge_category
+                    else:
+                        judge_category = cached_category
                 except Exception as e:
                     system_errors.append(f"judge: {e}")
 
@@ -581,7 +610,14 @@ def run_experiment(
     Returns:
         List of EvalResult for all queries and systems
     """
-    _load_llm_caches()
+    llm_config = config.get("llm", {})
+    use_llm_cache = bool(llm_config.get("use_cache", True))
+    llm_cache_path = _resolve_llm_cache_path(llm_config)
+    if use_llm_cache:
+        _load_llm_caches(llm_cache_path)
+    else:
+        _SYNTHESIS_CACHE.clear()
+        _JUDGE_CACHE.clear()
 
     # Load config values
     N = config.get("retrieval", {}).get("N", DEFAULT_N)
@@ -597,7 +633,6 @@ def run_experiment(
     n_topics = config.get("n_topics")
     use_preprocessed_corpus = config.get("retrieval", {}).get("use_preprocessed_corpus", True)
 
-    llm_config = config.get("llm", {})
     llm_concurrency = max(1, int(llm_config.get("concurrency", 1)))
 
     eval_topics = get_unique_topics(paired_docs, sort_by_frequency=True)
@@ -833,6 +868,7 @@ def run_experiment(
                 generator=shared_generator,
                 judge=shared_judge,
                 init_errors=shared_init_errors,
+                use_llm_cache=use_llm_cache,
             )
             all_results.extend(query_results)
     else:
@@ -854,6 +890,7 @@ def run_experiment(
                 generator=None,
                 judge=None,
                 init_errors=[],
+                use_llm_cache=use_llm_cache,
             )
             return topic_idx, results
 
@@ -867,7 +904,8 @@ def run_experiment(
         for idx in sorted(ordered_results):
             all_results.extend(ordered_results[idx])
 
-    _save_llm_caches()
+    if use_llm_cache:
+        _save_llm_caches(llm_cache_path)
     return all_results
 
 

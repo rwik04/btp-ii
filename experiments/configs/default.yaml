@@ -18,9 +18,22 @@ lfgd:
   tau: 0.05
 
 llm:
+  # LLM cache controls:
+  # - use_cache=false: always call LLMs (strictest model comparison, slowest)
+  # - cache_scope=per_model: fast, but isolates caches per synth/judge model config
+  # - cache_scope=shared: one cache file reused across all model configs
+  use_cache: true
+  cache_scope: per_model
+  cache_path: data/cache/llm_eval_cache.json
+
   # Synthesis models
-  synth_model: gpt-5.4-mini
-  synth_provider: openai
+  synth_model: 
+  #llama-3.3-70b-versatile
+  #qwen/qwen3-32b
+  #openai/gpt-oss-20b
+  #openai/gpt-oss-120b
+  #gpt-5.4-mini
+  synth_provider: groq #openai
   synth_reasoning_effort: low
 
   # Judge model
