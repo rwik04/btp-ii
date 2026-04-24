@@ -109,3 +109,7 @@ def main():
     print("Testing embed_texts...")
     result = embed_texts.local(test_texts)
     print(f"Got {len(result)} embeddings, each shape: {len(result[0])}")
+
+
+if __name__ == "__main__":
+    main()

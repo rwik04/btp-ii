@@ -63,6 +63,18 @@ uv run python analysis/axis_correlation.py --results-dir results/
 uv run python analysis/results_summary.py --results-dir results/
 ```
 
+For faster axis correlation retrieval on large topic sets, tune batched retrieval:
+
+```bash
+uv run python analysis/axis_correlation.py --results-dir results/ --retrieval-batch-size 256
+```
+
+To offload embedding generation to Modal GPU:
+
+```bash
+uv run python analysis/axis_correlation.py --results-dir results/ --use-modal-embedding --modal-batch-size 512
+```
+
 ## Tests
 
 ```bash
